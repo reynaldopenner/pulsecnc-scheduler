@@ -2,9 +2,18 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
+// --- Timezone Configuration ---
+// Central Standard Time is UTC-6. 
+// (Change this to -7 or -5 depending on your exact region in Mexico)
+const SHOP_TZ_OFFSET = -6; 
+
+// Helper to translate Server Time to Physical Shop Time
+function getShopTime(dateObj) {
+    return new Date(dateObj.getTime() + (SHOP_TZ_OFFSET * 3600000));
+}
+
 // --- 1. HELPER FUNCTION: Build Virtual Calendars ---
 function buildCalendars(workingHoursArray, holidaysArray) {
-    // Maps your text days (English or Spanish) to JavaScript's 0-6 day numbers
     const dayMap = { 
         "Sunday": 0, "Domingo": 0, 
         "Monday": 1, "Lunes": 1, 
@@ -15,7 +24,6 @@ function buildCalendars(workingHoursArray, holidaysArray) {
         "Saturday": 6, "Sábado": 6, "Sabado": 6 
     };
     
-    // Create a 2D map: scheduleMap[DayNumber][Hour] = true/false
     const scheduleMap = {};
     for(let i=0; i<=6; i++) scheduleMap[i] = {}; 
 
@@ -26,11 +34,12 @@ function buildCalendars(workingHoursArray, holidaysArray) {
         }
     });
 
-    // Create a fast-lookup Set for holidays
     const holidaysSet = new Set();
     if (holidaysArray) {
         holidaysArray.forEach(h => {
-            const dateStr = h.split('T')[0]; // Grabs just "YYYY-MM-DD"
+            // Shift the holiday to local time before extracting the date
+            const shopHoliday = getShopTime(new Date(h));
+            const dateStr = shopHoliday.toISOString().split('T')[0]; 
             holidaysSet.add(dateStr);
         });
     }
@@ -43,28 +52,33 @@ function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) 
     let currentTime = new Date(startDateObj);
     let minutesLeft = totalMinutes;
 
-    // Failsafe: Ensure we don't start a job during off-hours
-    // If the start time is invalid, push the clock forward until the shop opens
+    // Failsafe: Push clock forward until the shop opens
     while (true) {
-        const dateStr = currentTime.toISOString().split('T')[0];
+        const shopTime = getShopTime(currentTime);
+        const dateStr = shopTime.toISOString().split('T')[0];
         const isHoliday = holidaysSet.has(dateStr);
-        const isWorkingHour = scheduleMap[currentTime.getDay()][currentTime.getHours()] === true;
+        
+        // Evaluate the day and hour based on LOCAL time
+        const dayNum = shopTime.getUTCDay();
+        const hour = shopTime.getUTCHours();
+        const isWorkingHour = scheduleMap[dayNum][hour] === true;
         
         if (!isHoliday && isWorkingHour) break; 
-        currentTime.setMinutes(currentTime.getMinutes() + 1); // Step forward 1 minute
+        currentTime.setMinutes(currentTime.getMinutes() + 1); 
     }
 
-    // Step forward minute-by-minute, only burning time when the shop is active
+    // Step forward minute-by-minute
     while (minutesLeft > 0) {
-        const dateStr = currentTime.toISOString().split('T')[0];
-        const dayNum = currentTime.getDay();
-        const hour = currentTime.getHours();
+        const shopTime = getShopTime(currentTime);
+        const dateStr = shopTime.toISOString().split('T')[0];
+        const dayNum = shopTime.getUTCDay();
+        const hour = shopTime.getUTCHours();
 
         const isHoliday = holidaysSet.has(dateStr);
         const isWorkingHour = scheduleMap[dayNum][hour] === true;
 
         if (!isHoliday && isWorkingHour) {
-            minutesLeft--; // Valid work minute, deduct it from the job
+            minutesLeft--; 
         }
         
         if (minutesLeft > 0) {
@@ -80,8 +94,6 @@ app.post('/api/schedule', (req, res) => {
     const { job_id, start_date, operations, working_hours, holidays } = req.body;
     
     operations.sort((a, b) => a.sequence - b.sequence);
-    
-    // Compile the calendars
     const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays);
 
     let currentTime = new Date(start_date);
@@ -89,11 +101,7 @@ app.post('/api/schedule', (req, res) => {
 
     operations.forEach(op => {
         const totalMinutes = op.setup_time + op.run_time;
-        
-        // Mark the start time (this will automatically be pushed to open hours by the function)
         const opStart = new Date(currentTime);
-        
-        // Calculate the end time using our custom calendar logic
         const opEnd = calculateEndDate(opStart, totalMinutes, scheduleMap, holidaysSet);
 
         scheduledOperations.push({
@@ -104,7 +112,6 @@ app.post('/api/schedule', (req, res) => {
             scheduled_end: opEnd.toISOString()
         });
 
-        // The next operation starts exactly when this one finishes
         currentTime = new Date(opEnd); 
     });
 
