@@ -2,17 +2,12 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// --- Timezone Configuration ---
-// Central Standard Time is UTC-6. 
-// (Change this to -7 or -5 depending on your exact region in Mexico)
 const SHOP_TZ_OFFSET = -6; 
 
-// Helper to translate Server Time to Physical Shop Time
 function getShopTime(dateObj) {
     return new Date(dateObj.getTime() + (SHOP_TZ_OFFSET * 3600000));
 }
 
-// --- 1. HELPER FUNCTION: Build Virtual Calendars ---
 function buildCalendars(workingHoursArray, holidaysArray) {
     const dayMap = { 
         "Sunday": 0, "Domingo": 0, 
@@ -30,14 +25,13 @@ function buildCalendars(workingHoursArray, holidaysArray) {
     workingHoursArray.forEach(wh => {
         const dayNum = dayMap[wh.day];
         if (dayNum !== undefined) {
-            scheduleMap[dayNum][wh.hour] = wh.active;
+            scheduleMap[dayNum][wh.hour] = wh.active === true || wh.active === "true"; // Failsafe for Bubble booleans
         }
     });
 
     const holidaysSet = new Set();
     if (holidaysArray) {
         holidaysArray.forEach(h => {
-            // Shift the holiday to local time before extracting the date
             const shopHoliday = getShopTime(new Date(h));
             const dateStr = shopHoliday.toISOString().split('T')[0]; 
             holidaysSet.add(dateStr);
@@ -47,18 +41,15 @@ function buildCalendars(workingHoursArray, holidaysArray) {
     return { scheduleMap, holidaysSet };
 }
 
-// --- 2. HELPER FUNCTION: The Calendar-Aware Clock ---
 function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) {
     let currentTime = new Date(startDateObj);
-    let minutesLeft = totalMinutes;
+    let minutesLeft = Math.ceil(totalMinutes); // Failsafe: No decimals allowed in our loop
 
     // Failsafe: Push clock forward until the shop opens
     while (true) {
         const shopTime = getShopTime(currentTime);
         const dateStr = shopTime.toISOString().split('T')[0];
         const isHoliday = holidaysSet.has(dateStr);
-        
-        // Evaluate the day and hour based on LOCAL time
         const dayNum = shopTime.getUTCDay();
         const hour = shopTime.getUTCHours();
         const isWorkingHour = scheduleMap[dayNum][hour] === true;
@@ -89,10 +80,13 @@ function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) 
     return currentTime;
 }
 
-// --- 3. MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
     const { job_id, start_date, operations, working_hours, holidays } = req.body;
     
+    console.log(`\n--- NEW SCHEDULING REQUEST FOR JOB: ${job_id} ---`);
+    console.log(`Received ${working_hours ? working_hours.length : 0} working hour rules.`);
+    console.log(`Received ${holidays ? holidays.length : 0} holidays.`);
+
     operations.sort((a, b) => a.sequence - b.sequence);
     const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays);
 
@@ -115,6 +109,8 @@ app.post('/api/schedule', (req, res) => {
         currentTime = new Date(opEnd); 
     });
 
+    console.log(`Successfully scheduled ${operations.length} operations. Target completion: ${currentTime.toISOString()}`);
+
     res.json({
         job_id: job_id,
         status: "success",
@@ -124,4 +120,4 @@ app.post('/api/schedule', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`PulseCNC Scheduler running on port ${PORT}`));
+app.listen(PORT, () => console.log(`PulseCNC V3 Scheduler running on port ${PORT}`));
