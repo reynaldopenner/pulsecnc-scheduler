@@ -41,9 +41,10 @@ function buildCalendars(workingHoursArray, holidaysArray) {
     return { scheduleMap, holidaysSet };
 }
 
-function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) {
+// --- 2. HELPER FUNCTION: The Calendar-Aware Clock ---
+function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holidaysSet) {
     let currentTime = new Date(startDateObj);
-    let minutesLeft = Math.ceil(totalMinutes); // Failsafe: No decimals allowed in our loop
+    let minutesLeft = Math.ceil(totalMinutes);
 
     // Failsafe: Push clock forward until the shop opens
     while (true) {
@@ -57,6 +58,9 @@ function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) 
         if (!isHoliday && isWorkingHour) break; 
         currentTime.setMinutes(currentTime.getMinutes() + 1); 
     }
+
+    // THE FIX: Record the actual start time AFTER we waited for the shop to open
+    const actualStartTime = new Date(currentTime);
 
     // Step forward minute-by-minute
     while (minutesLeft > 0) {
@@ -77,15 +81,17 @@ function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) 
         }
     }
     
-    return currentTime;
+    return {
+        actualStart: actualStartTime,
+        actualEnd: currentTime
+    };
 }
 
+// --- 3. MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
     const { job_id, start_date, operations, working_hours, holidays } = req.body;
     
     console.log(`\n--- NEW SCHEDULING REQUEST FOR JOB: ${job_id} ---`);
-    console.log(`Received ${working_hours ? working_hours.length : 0} working hour rules.`);
-    console.log(`Received ${holidays ? holidays.length : 0} holidays.`);
 
     operations.sort((a, b) => a.sequence - b.sequence);
     const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays);
@@ -95,21 +101,24 @@ app.post('/api/schedule', (req, res) => {
 
     operations.forEach(op => {
         const totalMinutes = op.setup_time + op.run_time;
-        const opStart = new Date(currentTime);
-        const opEnd = calculateEndDate(opStart, totalMinutes, scheduleMap, holidaysSet);
+        const proposedStart = new Date(currentTime);
+        
+        // Run our updated function that returns both the real start and end times
+        const times = calculateOperationTimes(proposedStart, totalMinutes, scheduleMap, holidaysSet);
 
         scheduledOperations.push({
             operation_id: op.id,
             sequence: op.sequence,
             work_center: op.work_center,
-            scheduled_start: opStart.toISOString(),
-            scheduled_end: opEnd.toISOString()
+            scheduled_start: times.actualStart.toISOString(),
+            scheduled_end: times.actualEnd.toISOString()
         });
 
-        currentTime = new Date(opEnd); 
+        // Set the clock for the next operation to start when this one actually finishes
+        currentTime = new Date(times.actualEnd); 
     });
 
-    console.log(`Successfully scheduled ${operations.length} operations. Target completion: ${currentTime.toISOString()}`);
+    console.log(`Successfully scheduled ${operations.length} operations.`);
 
     res.json({
         job_id: job_id,
