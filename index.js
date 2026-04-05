@@ -1,32 +1,101 @@
 const express = require('express');
 const app = express();
-
 app.use(express.json());
 
-app.post('/api/schedule', (req, res) => {
-    // 1. Unpack the payload sent from PulseCNC
-    const { job_id, start_date, operations } = req.body;
+// --- 1. HELPER FUNCTION: Build Virtual Calendars ---
+function buildCalendars(workingHoursArray, holidaysArray) {
+    // Maps your text days (English or Spanish) to JavaScript's 0-6 day numbers
+    const dayMap = { 
+        "Sunday": 0, "Domingo": 0, 
+        "Monday": 1, "Lunes": 1, 
+        "Tuesday": 2, "Martes": 2, 
+        "Wednesday": 3, "Miércoles": 3, "Miercoles": 3,
+        "Thursday": 4, "Jueves": 4, 
+        "Friday": 5, "Viernes": 5, 
+        "Saturday": 6, "Sábado": 6, "Sabado": 6 
+    };
     
-    // 2. Safety Check: Sort operations by sequence number just in case they arrive out of order
-    operations.sort((a, b) => a.sequence - b.sequence);
+    // Create a 2D map: scheduleMap[DayNumber][Hour] = true/false
+    const scheduleMap = {};
+    for(let i=0; i<=6; i++) scheduleMap[i] = {}; 
 
-    // 3. Set our running clock to the Job's start date
+    workingHoursArray.forEach(wh => {
+        const dayNum = dayMap[wh.day];
+        if (dayNum !== undefined) {
+            scheduleMap[dayNum][wh.hour] = wh.active;
+        }
+    });
+
+    // Create a fast-lookup Set for holidays
+    const holidaysSet = new Set();
+    if (holidaysArray) {
+        holidaysArray.forEach(h => {
+            const dateStr = h.split('T')[0]; // Grabs just "YYYY-MM-DD"
+            holidaysSet.add(dateStr);
+        });
+    }
+
+    return { scheduleMap, holidaysSet };
+}
+
+// --- 2. HELPER FUNCTION: The Calendar-Aware Clock ---
+function calculateEndDate(startDateObj, totalMinutes, scheduleMap, holidaysSet) {
+    let currentTime = new Date(startDateObj);
+    let minutesLeft = totalMinutes;
+
+    // Failsafe: Ensure we don't start a job during off-hours
+    // If the start time is invalid, push the clock forward until the shop opens
+    while (true) {
+        const dateStr = currentTime.toISOString().split('T')[0];
+        const isHoliday = holidaysSet.has(dateStr);
+        const isWorkingHour = scheduleMap[currentTime.getDay()][currentTime.getHours()] === true;
+        
+        if (!isHoliday && isWorkingHour) break; 
+        currentTime.setMinutes(currentTime.getMinutes() + 1); // Step forward 1 minute
+    }
+
+    // Step forward minute-by-minute, only burning time when the shop is active
+    while (minutesLeft > 0) {
+        const dateStr = currentTime.toISOString().split('T')[0];
+        const dayNum = currentTime.getDay();
+        const hour = currentTime.getHours();
+
+        const isHoliday = holidaysSet.has(dateStr);
+        const isWorkingHour = scheduleMap[dayNum][hour] === true;
+
+        if (!isHoliday && isWorkingHour) {
+            minutesLeft--; // Valid work minute, deduct it from the job
+        }
+        
+        if (minutesLeft > 0) {
+            currentTime.setMinutes(currentTime.getMinutes() + 1);
+        }
+    }
+    
+    return currentTime;
+}
+
+// --- 3. MAIN ENDPOINT ---
+app.post('/api/schedule', (req, res) => {
+    const { job_id, start_date, operations, working_hours, holidays } = req.body;
+    
+    operations.sort((a, b) => a.sequence - b.sequence);
+    
+    // Compile the calendars
+    const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays);
+
     let currentTime = new Date(start_date);
     const scheduledOperations = [];
 
-    // 4. The Core Loop
     operations.forEach(op => {
-        // Calculate total time in minutes
         const totalMinutes = op.setup_time + op.run_time;
-
-        // Record the start time for this specific operation
+        
+        // Mark the start time (this will automatically be pushed to open hours by the function)
         const opStart = new Date(currentTime);
         
-        // Add the minutes to calculate the end time
-        // (JavaScript Date objects do math in milliseconds, so we multiply minutes by 60,000)
-        const opEnd = new Date(currentTime.getTime() + totalMinutes * 60000);
+        // Calculate the end time using our custom calendar logic
+        const opEnd = calculateEndDate(opStart, totalMinutes, scheduleMap, holidaysSet);
 
-        // Store the results
         scheduledOperations.push({
             operation_id: op.id,
             sequence: op.sequence,
@@ -35,11 +104,10 @@ app.post('/api/schedule', (req, res) => {
             scheduled_end: opEnd.toISOString()
         });
 
-        // Push our running clock forward so the next operation starts when this one ends
+        // The next operation starts exactly when this one finishes
         currentTime = new Date(opEnd); 
     });
 
-    // 5. Send the finished schedule back
     res.json({
         job_id: job_id,
         status: "success",
