@@ -2,13 +2,13 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-const SHOP_TZ_OFFSET = -6; 
-
-function getShopTime(dateObj) {
-    return new Date(dateObj.getTime() + (SHOP_TZ_OFFSET * 3600000));
+// Helper to translate Server Time to Physical Shop Time using the dynamic offset
+function getShopTime(dateObj, tzOffsetHours) {
+    return new Date(dateObj.getTime() + (tzOffsetHours * 3600000));
 }
 
-function buildCalendars(workingHoursArray, holidaysArray) {
+// --- 1. HELPER FUNCTION: Build Virtual Calendars ---
+function buildCalendars(workingHoursArray, holidaysArray, tzOffsetHours) {
     const dayMap = { 
         "Sunday": 0, "Domingo": 0, 
         "Monday": 1, "Lunes": 1, 
@@ -25,14 +25,15 @@ function buildCalendars(workingHoursArray, holidaysArray) {
     workingHoursArray.forEach(wh => {
         const dayNum = dayMap[wh.day];
         if (dayNum !== undefined) {
-            scheduleMap[dayNum][wh.hour] = wh.active === true || wh.active === "true"; // Failsafe for Bubble booleans
+            scheduleMap[dayNum][wh.hour] = wh.active === true || wh.active === "true";
         }
     });
 
     const holidaysSet = new Set();
     if (holidaysArray) {
         holidaysArray.forEach(h => {
-            const shopHoliday = getShopTime(new Date(h));
+            // Use the dynamic offset to map holidays correctly
+            const shopHoliday = getShopTime(new Date(h), tzOffsetHours);
             const dateStr = shopHoliday.toISOString().split('T')[0]; 
             holidaysSet.add(dateStr);
         });
@@ -42,13 +43,12 @@ function buildCalendars(workingHoursArray, holidaysArray) {
 }
 
 // --- 2. HELPER FUNCTION: The Calendar-Aware Clock ---
-function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holidaysSet) {
+function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holidaysSet, tzOffsetHours) {
     let currentTime = new Date(startDateObj);
     let minutesLeft = Math.ceil(totalMinutes);
 
-    // Failsafe: Push clock forward until the shop opens
     while (true) {
-        const shopTime = getShopTime(currentTime);
+        const shopTime = getShopTime(currentTime, tzOffsetHours);
         const dateStr = shopTime.toISOString().split('T')[0];
         const isHoliday = holidaysSet.has(dateStr);
         const dayNum = shopTime.getUTCDay();
@@ -59,12 +59,10 @@ function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holida
         currentTime.setMinutes(currentTime.getMinutes() + 1); 
     }
 
-    // THE FIX: Record the actual start time AFTER we waited for the shop to open
     const actualStartTime = new Date(currentTime);
 
-    // Step forward minute-by-minute
     while (minutesLeft > 0) {
-        const shopTime = getShopTime(currentTime);
+        const shopTime = getShopTime(currentTime, tzOffsetHours);
         const dateStr = shopTime.toISOString().split('T')[0];
         const dayNum = shopTime.getUTCDay();
         const hour = shopTime.getUTCHours();
@@ -89,12 +87,19 @@ function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holida
 
 // --- 3. MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
-    const { job_id, start_date, operations, working_hours, holidays } = req.body;
+    // 1. We now extract tz_offset from Bubble's payload!
+    const { job_id, start_date, operations, working_hours, holidays, tz_offset } = req.body;
     
+    // 2. Default to UTC (0) if the payload is missing the offset to prevent crashes
+    const safeOffset = tz_offset !== undefined ? parseFloat(tz_offset) : 0;
+
     console.log(`\n--- NEW SCHEDULING REQUEST FOR JOB: ${job_id} ---`);
+    console.log(`Calculated with Timezone Offset: ${safeOffset}`);
 
     operations.sort((a, b) => a.sequence - b.sequence);
-    const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays);
+    
+    // Pass the offset down into our helper functions
+    const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays, safeOffset);
 
     let currentTime = new Date(start_date);
     const scheduledOperations = [];
@@ -103,8 +108,7 @@ app.post('/api/schedule', (req, res) => {
         const totalMinutes = op.setup_time + op.run_time;
         const proposedStart = new Date(currentTime);
         
-        // Run our updated function that returns both the real start and end times
-        const times = calculateOperationTimes(proposedStart, totalMinutes, scheduleMap, holidaysSet);
+        const times = calculateOperationTimes(proposedStart, totalMinutes, scheduleMap, holidaysSet, safeOffset);
 
         scheduledOperations.push({
             operation_id: op.id,
@@ -114,7 +118,6 @@ app.post('/api/schedule', (req, res) => {
             scheduled_end: times.actualEnd.toISOString()
         });
 
-        // Set the clock for the next operation to start when this one actually finishes
         currentTime = new Date(times.actualEnd); 
     });
 
@@ -129,4 +132,4 @@ app.post('/api/schedule', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`PulseCNC V3 Scheduler running on port ${PORT}`));
+app.listen(PORT, () => console.log(`PulseCNC Scheduler running on port ${PORT}`));
