@@ -7,7 +7,6 @@ function getShopTime(dateObj, tzOffsetHours) {
     return new Date(dateObj.getTime() + (tzOffsetHours * 3600000));
 }
 
-// --- 1. HELPER FUNCTION: Build Virtual Calendars ---
 function buildCalendars(workingHoursArray, holidaysArray, tzOffsetHours) {
     const dayMap = { 
         "Sunday": 0, "Domingo": 0, 
@@ -32,7 +31,6 @@ function buildCalendars(workingHoursArray, holidaysArray, tzOffsetHours) {
     const holidaysSet = new Set();
     if (holidaysArray) {
         holidaysArray.forEach(h => {
-            // Use the dynamic offset to map holidays correctly
             const shopHoliday = getShopTime(new Date(h), tzOffsetHours);
             const dateStr = shopHoliday.toISOString().split('T')[0]; 
             holidaysSet.add(dateStr);
@@ -42,7 +40,6 @@ function buildCalendars(workingHoursArray, holidaysArray, tzOffsetHours) {
     return { scheduleMap, holidaysSet };
 }
 
-// --- 2. HELPER FUNCTION: The Calendar-Aware Clock ---
 function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holidaysSet, tzOffsetHours) {
     let currentTime = new Date(startDateObj);
     let minutesLeft = Math.ceil(totalMinutes);
@@ -85,20 +82,17 @@ function calculateOperationTimes(startDateObj, totalMinutes, scheduleMap, holida
     };
 }
 
-// --- 3. MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
-    // 1. We now extract tz_offset from Bubble's payload!
+    // Extract tz_offset from Bubble's payload
     const { job_id, start_date, operations, working_hours, holidays, tz_offset } = req.body;
     
-    // 2. Default to UTC (0) if the payload is missing the offset to prevent crashes
+    // Default to UTC (0) if the payload is missing the offset to prevent crashes
     const safeOffset = tz_offset !== undefined ? parseFloat(tz_offset) : 0;
 
     console.log(`\n--- NEW SCHEDULING REQUEST FOR JOB: ${job_id} ---`);
     console.log(`Calculated with Timezone Offset: ${safeOffset}`);
 
     operations.sort((a, b) => a.sequence - b.sequence);
-    
-    // Pass the offset down into our helper functions
     const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays, safeOffset);
 
     let currentTime = new Date(start_date);
