@@ -207,3 +207,6 @@ app.post('/api/schedule', (req, res) => {
         schedule: scheduledOperations
     });
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`PulseCNC Finite Scheduler running on port ${PORT}`));
