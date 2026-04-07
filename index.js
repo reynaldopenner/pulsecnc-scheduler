@@ -79,9 +79,16 @@ function isMachineBusy(machineName, currentTime, existingTasks) {
     });
 }
 
-function calculateOperationTimes(op, startDateObj, scheduleMap, holidaysSet, tzOffsetHours, existingTasks, dailyLaborMap, laborLimit) {
+// ... (Keep buildCalendars, buildLaborMap, and isMachineBusy the same as before) ...
+
+// 4. The Upgraded Finite Engine (Now takes a specific machine to test)
+function simulateMachineTime(machineName, op, startDateObj, scheduleMap, holidaysSet, tzOffsetHours, existingTasks, dailyLaborMap, laborLimit) {
     let currentTime = new Date(startDateObj);
     let minutesLeft = Math.ceil(op.setup_time + op.run_time);
+    
+    // We create a temporary copy of the labor map just for this simulation 
+    // so we don't accidentally save the math if this machine loses the race.
+    const simLaborMap = { ...dailyLaborMap };
 
     while (true) {
         const shopTime = getShopTime(currentTime, tzOffsetHours);
@@ -91,9 +98,9 @@ function calculateOperationTimes(op, startDateObj, scheduleMap, holidaysSet, tzO
 
         const isHoliday = holidaysSet.has(dateStr);
         const isWorkingHour = scheduleMap[dayNum][hour] === true;
-        const machineBusy = isMachineBusy(op.work_center, currentTime, existingTasks);
+        const machineBusy = isMachineBusy(machineName, currentTime, existingTasks); // Test THIS specific machine
         
-        const currentDayLabor = dailyLaborMap[dateStr] || 0;
+        const currentDayLabor = simLaborMap[dateStr] || 0;
         const laborFull = currentDayLabor >= laborLimit;
         
         if (!isHoliday && isWorkingHour && !machineBusy && !laborFull) break; 
@@ -110,14 +117,14 @@ function calculateOperationTimes(op, startDateObj, scheduleMap, holidaysSet, tzO
 
         const isHoliday = holidaysSet.has(dateStr);
         const isWorkingHour = scheduleMap[dayNum][hour] === true;
-        const machineBusy = isMachineBusy(op.work_center, currentTime, existingTasks);
+        const machineBusy = isMachineBusy(machineName, currentTime, existingTasks);
 
-        const currentDayLabor = dailyLaborMap[dateStr] || 0;
+        const currentDayLabor = simLaborMap[dateStr] || 0;
         const laborFull = currentDayLabor >= laborLimit;
 
         if (!isHoliday && isWorkingHour && !machineBusy && !laborFull) {
             minutesLeft--; 
-            dailyLaborMap[dateStr] = currentDayLabor + 1;
+            simLaborMap[dateStr] = currentDayLabor + 1;
         }
         
         if (minutesLeft > 0) {
@@ -126,53 +133,72 @@ function calculateOperationTimes(op, startDateObj, scheduleMap, holidaysSet, tzO
     }
     
     return {
+        machine: machineName,
         actualStart: actualStartTime,
-        actualEnd: currentTime
+        actualEnd: currentTime,
+        finalLaborMap: simLaborMap // Return the updated labor bucket
     };
 }
 
+// --- MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
     const { job_id, start_date, operations, working_hours, holidays, tz_offset, daily_labor_minutes, existing_tasks } = req.body;
     
+    let currentTime = new Date(start_date);
+    if (isNaN(currentTime.getTime())) {
+        return res.status(400).json({ status: "error", message: "Invalid or missing start_date" });
+    }
+
     const safeOffset = tz_offset !== undefined ? parseFloat(tz_offset) : 0;
     const laborLimit = daily_labor_minutes || 999999; 
     const safeExistingTasks = existing_tasks || [];
 
-    console.log(`\n--- FINITE SCHEDULING REQUEST: ${job_id} ---`);
-    console.log(`Shop Labor Limit: ${laborLimit} minutes/day`);
-
     operations.sort((a, b) => a.sequence - b.sequence);
     
     const { scheduleMap, holidaysSet } = buildCalendars(working_hours, holidays, safeOffset);
-    const dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset);
+    let dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset);
 
-    let currentTime = new Date(start_date);
     const scheduledOperations = [];
 
     operations.forEach(op => {
         const proposedStart = new Date(currentTime);
         
-        const times = calculateOperationTimes(op, proposedStart, scheduleMap, holidaysSet, safeOffset, safeExistingTasks, dailyLaborMap, laborLimit);
+        // 1. Convert the comma-separated string from Bubble into a clean array
+        // Fallback to "Unassigned" if Bubble sends nothing.
+        const machinesToTest = op.eligible_machines ? op.eligible_machines.split(',').map(m => m.trim()) : ["Unassigned"];
+        
+        let bestResult = null;
 
+        // 2. THE RACE: Simulate the job on every eligible machine
+        machinesToTest.forEach(machine => {
+            const simResult = simulateMachineTime(machine, op, proposedStart, scheduleMap, holidaysSet, safeOffset, safeExistingTasks, dailyLaborMap, laborLimit);
+            
+            // If this is the first machine we checked, or if it finished EARLIER than the previous best, it becomes the new winner.
+            if (!bestResult || simResult.actualEnd < bestResult.actualEnd) {
+                bestResult = simResult;
+            }
+        });
+
+        // 3. Lock in the winner!
         scheduledOperations.push({
             operation_id: op.id,
             sequence: op.sequence,
-            work_center: op.work_center,
-            scheduled_start: times.actualStart.toISOString(),
-            scheduled_end: times.actualEnd.toISOString()
+            work_center: bestResult.machine, // The Node server tells Bubble who won!
+            scheduled_start: bestResult.actualStart.toISOString(),
+            scheduled_end: bestResult.actualEnd.toISOString()
         });
 
+        // Update our master lists with the winning machine's data
         safeExistingTasks.push({
-            m: op.work_center,
-            s: times.actualStart.toISOString(),
-            e: times.actualEnd.toISOString(),
+            m: bestResult.machine,
+            s: bestResult.actualStart.toISOString(),
+            e: bestResult.actualEnd.toISOString(),
             t: op.setup_time + op.run_time
         });
-
-        currentTime = new Date(times.actualEnd); 
+        
+        dailyLaborMap = bestResult.finalLaborMap; // Commit the labor used by the winner
+        currentTime = new Date(bestResult.actualEnd); // Start the next operation when this one finishes
     });
-
-    console.log(`Successfully scheduled ${operations.length} operations.`);
 
     res.json({
         job_id: job_id,
@@ -181,6 +207,3 @@ app.post('/api/schedule', (req, res) => {
         schedule: scheduledOperations
     });
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`PulseCNC Finite Scheduler running on port ${PORT}`));
