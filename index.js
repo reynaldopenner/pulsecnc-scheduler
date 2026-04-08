@@ -169,20 +169,32 @@ function simulateBackward(machineName, op, targetEndObj, scheduleMap, holidaysSe
 }
 
 // --- MAIN ENDPOINT ---
-// --- MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
     const { job_id, schedule_mode, start_date, target_date, operations, working_hours, holidays, tz_offset, daily_labor_minutes, existing_tasks } = req.body;
     
+    // 1. VALIDATE START DATE
     const rootStartDate = new Date(start_date);
     if (isNaN(rootStartDate.getTime())) return res.status(400).json({ status: "error", message: "Invalid start_date" });
+
+    // 2. NEW: THE "FAIL FAST" MACHINE VALIDATION
+    // Check if any operation has a blank or missing eligible_machines string
+    const missingMachineOp = operations.find(op => !op.eligible_machines || op.eligible_machines.trim() === "");
+    if (missingMachineOp) {
+        console.log(`ERROR: No machines found for Operation ${missingMachineOp.sequence}. Aborting schedule.`);
+        return res.json({
+            job_id: job_id,
+            status: "error_no_machines",
+            message: `Operation ${missingMachineOp.sequence} has no eligible machines. Please check machine capabilities and features.`,
+            schedule: [] // Return an empty schedule so Bubble doesn't try to save anything
+        });
+    }
 
     const safeOffset = tz_offset !== undefined ? parseFloat(tz_offset) : 0;
     const laborLimit = daily_labor_minutes || 999999; 
     const mode = schedule_mode === "backward" ? "backward" : "forward";
 
-    // THE FIX: Create a strict, immutable clone of the tasks coming from Bubble
     const baseTasks = existing_tasks ? [...existing_tasks] : [];
-    let safeExistingTasks = [...baseTasks]; // The engine plays with this copy
+    let safeExistingTasks = [...baseTasks]; 
 
     console.log(`\n--- REQUEST: ${job_id} | MODE: ${mode.toUpperCase()} ---`);
 
@@ -190,23 +202,22 @@ app.post('/api/schedule', (req, res) => {
     let dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset);
     let scheduledOperations = [];
     let isImpossibleDeadline = false;
-    
+
     // --- EXECUTE BACKWARD SCHEDULING ---
     if (mode === "backward") {
         const deadline = new Date(target_date);
         if (isNaN(deadline.getTime())) return res.status(400).json({ status: "error", message: "Backward scheduling requires a valid target_date" });
 
-        // Reverse sort: Op 3, then Op 2, then Op 1
         let reverseOps = [...operations].sort((a, b) => b.sequence - a.sequence);
         let currentTime = new Date(deadline);
 
         reverseOps.forEach(op => {
-            const machinesToTest = op.eligible_machines ? op.eligible_machines.split(',').map(m => m.trim()) : ["Unassigned"];
+            // We can now safely split the string without the fallback because of our validation above
+            const machinesToTest = op.eligible_machines.split(',').map(m => m.trim());
             let bestResult = null;
 
             machinesToTest.forEach(machine => {
                 const simResult = simulateBackward(machine, op, currentTime, scheduleMap, holidaysSet, safeOffset, safeExistingTasks, dailyLaborMap, laborLimit);
-                // In backwards mode, we want the machine that starts LATEST (closest to the deadline)
                 if (!bestResult || simResult.actualStart > bestResult.actualStart) bestResult = simResult;
             });
 
@@ -217,23 +228,20 @@ app.post('/api/schedule', (req, res) => {
 
             safeExistingTasks.push({ m: bestResult.machine, s: bestResult.actualStart.toISOString(), e: bestResult.actualEnd.toISOString(), t: op.setup_time + op.run_time });
             dailyLaborMap = bestResult.finalLaborMap;
-            currentTime = new Date(bestResult.actualStart); // The previous operation must finish before this one starts
+            currentTime = new Date(bestResult.actualStart); 
         });
 
-// Check the Fallback: Did Op 1 get pushed into the past?
         if (currentTime < rootStartDate) {
             console.log("WARNING: Deadline impossible. Triggering Forward Fallback.");
             isImpossibleDeadline = true;
-            scheduledOperations = []; // Clear the backward schedule
+            scheduledOperations = []; 
             
-            // THE FIX: Throw away the corrupted copy and restore from the clean backup!
             safeExistingTasks = [...baseTasks]; 
-            dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset); // Recalculate labor map
+            dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset); 
         } else {
-            // Success! Re-sort back to normal order to send to Bubble
             scheduledOperations.sort((a, b) => a.sequence - b.sequence);
         }
-        }
+    }
 
     // --- EXECUTE FORWARD SCHEDULING (Or Fallback) ---
     if (mode === "forward" || isImpossibleDeadline) {
@@ -241,12 +249,11 @@ app.post('/api/schedule', (req, res) => {
         let currentTime = new Date(rootStartDate);
 
         forwardOps.forEach(op => {
-            const machinesToTest = op.eligible_machines ? op.eligible_machines.split(',').map(m => m.trim()) : ["Unassigned"];
+            const machinesToTest = op.eligible_machines.split(',').map(m => m.trim());
             let bestResult = null;
 
             machinesToTest.forEach(machine => {
                 const simResult = simulateForward(machine, op, currentTime, scheduleMap, holidaysSet, safeOffset, safeExistingTasks, dailyLaborMap, laborLimit);
-                // In forward mode, we want the machine that finishes EARLIEST
                 if (!bestResult || simResult.actualEnd < bestResult.actualEnd) bestResult = simResult;
             });
 
@@ -264,8 +271,9 @@ app.post('/api/schedule', (req, res) => {
     res.json({
         job_id: job_id,
         status: isImpossibleDeadline ? "warning_asap_fallback" : "success",
-        estimated_completion_date: scheduledOperations[scheduledOperations.length - 1].scheduled_end,
-        schedule: scheduledOperations
+        estimated_completion_date: scheduledOperations.length > 0 ? scheduledOperations[scheduledOperations.length - 1].scheduled_end : null,
+        schedule: scheduledOperations,
+        message: isImpossibleDeadline ? "Deadline impossible. Scheduled ASAP." : "Scheduled successfully."
     });
 });
 
