@@ -169,6 +169,7 @@ function simulateBackward(machineName, op, targetEndObj, scheduleMap, holidaysSe
 }
 
 // --- MAIN ENDPOINT ---
+// --- MAIN ENDPOINT ---
 app.post('/api/schedule', (req, res) => {
     const { job_id, schedule_mode, start_date, target_date, operations, working_hours, holidays, tz_offset, daily_labor_minutes, existing_tasks } = req.body;
     
@@ -177,8 +178,11 @@ app.post('/api/schedule', (req, res) => {
 
     const safeOffset = tz_offset !== undefined ? parseFloat(tz_offset) : 0;
     const laborLimit = daily_labor_minutes || 999999; 
-    const safeExistingTasks = existing_tasks || [];
     const mode = schedule_mode === "backward" ? "backward" : "forward";
+
+    // THE FIX: Create a strict, immutable clone of the tasks coming from Bubble
+    const baseTasks = existing_tasks ? [...existing_tasks] : [];
+    let safeExistingTasks = [...baseTasks]; // The engine plays with this copy
 
     console.log(`\n--- REQUEST: ${job_id} | MODE: ${mode.toUpperCase()} ---`);
 
@@ -186,7 +190,7 @@ app.post('/api/schedule', (req, res) => {
     let dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset);
     let scheduledOperations = [];
     let isImpossibleDeadline = false;
-
+    
     // --- EXECUTE BACKWARD SCHEDULING ---
     if (mode === "backward") {
         const deadline = new Date(target_date);
@@ -216,18 +220,20 @@ app.post('/api/schedule', (req, res) => {
             currentTime = new Date(bestResult.actualStart); // The previous operation must finish before this one starts
         });
 
-        // Check the Fallback: Did Op 1 get pushed into the past?
+// Check the Fallback: Did Op 1 get pushed into the past?
         if (currentTime < rootStartDate) {
             console.log("WARNING: Deadline impossible. Triggering Forward Fallback.");
             isImpossibleDeadline = true;
             scheduledOperations = []; // Clear the backward schedule
-            safeExistingTasks.length = existing_tasks ? existing_tasks.length : 0; // Reset existing tasks
-            dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset); // Reset labor map
+            
+            // THE FIX: Throw away the corrupted copy and restore from the clean backup!
+            safeExistingTasks = [...baseTasks]; 
+            dailyLaborMap = buildLaborMap(safeExistingTasks, scheduleMap, holidaysSet, safeOffset); // Recalculate labor map
         } else {
             // Success! Re-sort back to normal order to send to Bubble
             scheduledOperations.sort((a, b) => a.sequence - b.sequence);
         }
-    }
+        }
 
     // --- EXECUTE FORWARD SCHEDULING (Or Fallback) ---
     if (mode === "forward" || isImpossibleDeadline) {
