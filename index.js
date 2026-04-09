@@ -20,6 +20,105 @@ const DAY_MAP = {
 };
 
 // ─────────────────────────────────────────────
+//  WINDOWS → IANA TIMEZONE MAP
+//  Bubble (and many Windows-based systems) emit
+//  names like "Central Standard Time" instead of
+//  IANA strings. This map converts them so that
+//  Intl.DateTimeFormat works correctly.
+// ─────────────────────────────────────────────
+const WINDOWS_TO_IANA = {
+    // ── North America ──
+    "Eastern Standard Time":         "America/New_York",
+    "Eastern Summer Time":           "America/New_York",
+    "Central Standard Time":         "America/Chicago",
+    "Central Summer Time":           "America/Chicago",
+    "Mountain Standard Time":        "America/Denver",
+    "Mountain Summer Time":          "America/Denver",
+    "US Mountain Standard Time":     "America/Phoenix",       // Arizona — no DST
+    "Pacific Standard Time":         "America/Los_Angeles",
+    "Pacific Summer Time":           "America/Los_Angeles",
+    "Alaskan Standard Time":         "America/Anchorage",
+    "Hawaiian Standard Time":        "Pacific/Honolulu",
+    "Atlantic Standard Time":        "America/Halifax",
+    "Canada Central Standard Time":  "America/Regina",        // Saskatchewan — no DST
+    "Newfoundland Standard Time":    "America/St_Johns",
+
+    // ── Mexico ──
+    "Mexico Standard Time":          "America/Mexico_City",
+    "Mexico Summer Time":            "America/Mexico_City",
+    "Central America Standard Time": "America/Guatemala",
+    "SA Pacific Standard Time":      "America/Bogota",
+
+    // ── South America ──
+    "SA Eastern Standard Time":      "America/Sao_Paulo",
+    "E. South America Standard Time":"America/Sao_Paulo",
+    "Argentina Standard Time":       "America/Argentina/Buenos_Aires",
+    "Chile Standard Time":           "America/Santiago",
+    "Venezuela Standard Time":       "America/Caracas",
+    "SA Western Standard Time":      "America/La_Paz",
+
+    // ── Europe ──
+    "GMT Standard Time":             "Europe/London",
+    "Greenwich Standard Time":       "Atlantic/Reykjavik",
+    "W. Europe Standard Time":       "Europe/Berlin",
+    "Central Europe Standard Time":  "Europe/Budapest",
+    "Central European Standard Time":"Europe/Warsaw",
+    "Romance Standard Time":         "Europe/Paris",
+    "E. Europe Standard Time":       "Asia/Nicosia",
+    "FLE Standard Time":             "Europe/Helsinki",
+    "GTB Standard Time":             "Europe/Bucharest",
+    "Turkey Standard Time":          "Europe/Istanbul",
+    "Russian Standard Time":         "Europe/Moscow",
+
+    // ── Asia / Pacific ──
+    "China Standard Time":           "Asia/Shanghai",
+    "Tokyo Standard Time":           "Asia/Tokyo",
+    "Korea Standard Time":           "Asia/Seoul",
+    "India Standard Time":           "Asia/Kolkata",
+    "SE Asia Standard Time":         "Asia/Bangkok",
+    "Singapore Standard Time":       "Asia/Singapore",
+    "W. Australia Standard Time":    "Australia/Perth",
+    "AUS Eastern Standard Time":     "Australia/Sydney",
+    "E. Australia Standard Time":    "Australia/Brisbane",
+    "New Zealand Standard Time":     "Pacific/Auckland",
+
+    // ── Middle East / Africa ──
+    "Arab Standard Time":            "Asia/Riyadh",
+    "Arabian Standard Time":         "Asia/Dubai",
+    "Israel Standard Time":          "Asia/Jerusalem",
+    "South Africa Standard Time":    "Africa/Johannesburg",
+    "Egypt Standard Time":           "Africa/Cairo",
+
+    // ── UTC ──
+    "UTC":                           "UTC",
+    "Coordinated Universal Time":    "UTC"
+};
+
+/**
+ * Converts any timezone string to a valid IANA name.
+ * Accepts: IANA strings, Windows timezone names, numeric offsets.
+ */
+function resolveTimezone(raw) {
+    if (!raw) return 'UTC';
+
+    // Already a valid IANA string?
+    try {
+        Intl.DateTimeFormat(undefined, { timeZone: raw });
+        return raw;
+    } catch { /* not IANA — keep going */ }
+
+    // Windows name?
+    if (WINDOWS_TO_IANA[raw]) return WINDOWS_TO_IANA[raw];
+
+    // Numeric offset fallback (e.g. -6 or "-6")
+    const num = parseFloat(raw);
+    if (!isNaN(num)) return String(num); // handled in getShopFields catch block
+
+    console.warn(`  Unknown timezone "${raw}" — falling back to UTC`);
+    return 'UTC';
+}
+
+// ─────────────────────────────────────────────
 //  TIMEZONE HELPERS  (DST-safe via Intl)
 // ─────────────────────────────────────────────
 
@@ -372,19 +471,20 @@ app.post('/api/schedule', (req, res) => {
     // ── Validate start_date ──
     const rootStartMs = new Date(start_date).getTime();
     if (isNaN(rootStartMs))
-        return res.status(400).json({ status: 'error', message: 'Invalid start_date' });
+        return res.status(200).json({ status: 'error', message: 'Invalid start_date', schedule: [] });
 
     // ── Validate operations ──
     if (!Array.isArray(operations) || operations.length === 0)
-        return res.status(400).json({ status: 'error', message: 'operations must be a non-empty array' });
+        return res.status(200).json({ status: 'error', message: 'Operations list is empty or missing.', schedule: [] });
 
     const validationErrors = operations.flatMap((op, i) => validateOperation(op, i));
     if (validationErrors.length > 0)
-        return res.status(400).json({ status: 'error', message: validationErrors.join('; ') });
+        return res.status(200).json({ status: 'error', message: validationErrors.join('; '), schedule: [] });
 
     // ── Resolve timezone ──
-    // Accept either an IANA string ("America/Chihuahua") or the legacy numeric offset.
-    const tz = timezone || (tz_offset !== undefined ? String(tz_offset) : 'UTC');
+    // Accepts IANA strings, Windows timezone names, or legacy numeric offsets.
+    // "Central Standard Time" → "America/Chicago", "America/Chihuahua" → unchanged, -6 → "-6"
+    const tz = resolveTimezone(timezone || (tz_offset !== undefined ? String(tz_offset) : 'UTC'));
 
     const laborLimit = Number(daily_labor_minutes) || 999_999;
     const mode = schedule_mode === 'backward' ? 'backward' : 'forward';
@@ -407,7 +507,7 @@ app.post('/api/schedule', (req, res) => {
         if (mode === 'backward') {
             const deadlineMs = new Date(target_date).getTime();
             if (isNaN(deadlineMs))
-                return res.status(400).json({ status: 'error', message: 'backward scheduling requires a valid target_date' });
+                return res.status(200).json({ status: 'error', message: 'Backward scheduling requires a valid target date.', schedule: [] });
 
             const reverseOps = [...operations].sort((a, b) => b.sequence - a.sequence);
             let currentMs = deadlineMs;
@@ -518,7 +618,7 @@ app.post('/api/schedule', (req, res) => {
 
     } catch (err) {
         console.error('  SCHEDULER ERROR:', err.message);
-        return res.status(500).json({ status: 'error', message: err.message, schedule: [] });
+        return res.status(200).json({ status: 'error', message: err.message, schedule: [] });
     }
 
     const lastOp = scheduledOperations[scheduledOperations.length - 1];
